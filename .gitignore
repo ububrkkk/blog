@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+.pytest_cache/
+.coverage
+
+# Virtual env
+.venv/
+
+# Build / dist
+build/
+dist/
+*.spec
+
+# Local env
+.env
+
