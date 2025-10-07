@@ -2,34 +2,31 @@ from __future__ import annotations
 
 import csv
 import io
-import os
-import sys
 from typing import Dict, List, Tuple
 
 import streamlit as st
 
-# Allow running as a script (streamlit run ...) without PYTHONPATH set
-_SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _SRC_ROOT not in sys.path:
-    sys.path.insert(0, _SRC_ROOT)
-
-from blog_keyword_analyzer.env import load_env  # type: ignore
-from blog_keyword_analyzer.expansion import expand_with_profile, expand_with_suffixes  # type: ignore
-from blog_keyword_analyzer.outline import build_outline  # type: ignore
-from blog_keyword_analyzer.providers import GoogleSuggestProvider, NaverSuggestProvider  # type: ignore
-from blog_keyword_analyzer.scoring import (  # type: ignore
+from .env import load_env
+from .expansion import expand_with_profile, expand_with_suffixes
+from .outline import build_outline
+from .providers import GoogleSuggestProvider, NaverSuggestProvider
+from .scoring import (
     KeywordScore,
     score_keywords,
-    score_keywords_with_metrics,
     score_keywords_by_platform,
 )
-from blog_keyword_analyzer.text_utils import normalize_query, unique_ordered  # type: ignore
-from blog_keyword_analyzer.enrichers import build_enrichers_from_env, enrich_keywords, EnrichedMetrics  # type: ignore
+from .text_utils import normalize_query, unique_ordered
+from .enrichers import (
+    build_enrichers_from_env,
+    enrich_keywords,
+    EnrichedMetrics,
+)
+from .trends import compute_trends, default_hot_terms
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=30)
 def collect_suggestions_cached(
-    seeds: List[str], provider_names: List[str], depth: int, hl: str
+    seeds: List[str], provider_names: List[str], depth: int, hl: str, nonce: int = 0
 ) -> Tuple[List[str], Dict[str, int]]:
     provider_names = [p.strip().lower() for p in provider_names]
     providers = []
@@ -46,14 +43,12 @@ def collect_suggestions_cached(
             all_candidates.append(kw)
             hit_counts[kw] = hit_counts.get(kw, 0) + 1
 
-    # depth 1
     for p in providers:
         if isinstance(p, GoogleSuggestProvider):
             _accumulate(p.bulk_suggest(seeds, hl=hl))
         else:
             _accumulate(p.bulk_suggest(seeds))
 
-    # depth 2
     if depth >= 2:
         suffix_expanded = expand_with_suffixes(seeds)
         for p in providers:
@@ -68,25 +63,36 @@ def collect_suggestions_cached(
 def to_rows(scores: List[KeywordScore], metrics: Dict[str, EnrichedMetrics] | None) -> List[dict]:
     data: List[dict] = []
     for r in scores:
-        row = {
-            "keyword": r.keyword,
-            "opportunity": r.opportunity,
-            "demand": r.demand,
-            "competition": r.competition,
-            "provider_hits": r.provider_hits,
-        }
-        if metrics is not None:
-            m = metrics.get(r.keyword)
-            row.update(
-                {
-                    "naver_blog_total": getattr(m, "naver_blog_total", None) if m else None,
-                    "google_total": getattr(m, "google_total", None) if m else None,
-                    "naver_monthly_pc": getattr(m, "naver_monthly_pc", None) if m else None,
-                    "naver_monthly_mobile": getattr(m, "naver_monthly_mobile", None) if m else None,
-                    "naver_cpc": getattr(m, "naver_cpc", None) if m else None,
-                }
-            )
-        data.append(row)
+        data.append(
+            {
+                "keyword": r.keyword,
+                "opportunity": r.opportunity,
+                "demand": r.demand,
+                "competition": r.competition,
+                "provider_hits": r.provider_hits,
+                **(
+                    {}
+                    if metrics is None
+                    else {
+                        "naver_blog_total": getattr(metrics.get(r.keyword), "naver_blog_total", None)
+                        if metrics.get(r.keyword)
+                        else None,
+                        "google_total": getattr(metrics.get(r.keyword), "google_total", None)
+                        if metrics.get(r.keyword)
+                        else None,
+                        "naver_monthly_pc": getattr(metrics.get(r.keyword), "naver_monthly_pc", None)
+                        if metrics.get(r.keyword)
+                        else None,
+                        "naver_monthly_mobile": getattr(metrics.get(r.keyword), "naver_monthly_mobile", None)
+                        if metrics.get(r.keyword)
+                        else None,
+                        "naver_cpc": getattr(metrics.get(r.keyword), "naver_cpc", None)
+                        if metrics.get(r.keyword)
+                        else None,
+                    }
+                ),
+            }
+        )
     return data
 
 
@@ -116,6 +122,10 @@ def main() -> None:
         top = st.number_input("상위 미리보기", min_value=10, max_value=300, value=80, step=10)
         enrich = st.checkbox("API 보정 활용(--enrich)", value=False)
         enrich_limit = st.number_input("Enrich 상한", min_value=50, max_value=1000, value=200, step=50)
+        platforms = st.multiselect("플랫폼", ["naver", "tistory"], default=["naver", "tistory"])
+        st.divider()
+        st.caption("실시간 트렌드")
+        refresh = st.button("새로고침")
 
     seeds_text = st.text_area("시드 키워드 (줄 단위)", "제주 여행\n부산 맛집")
     run = st.button("실행")
@@ -125,14 +135,18 @@ def main() -> None:
         if not seeds:
             st.warning("시드 키워드를 1개 이상 입력하세요.")
             return
-        if not providers:
-            providers_use = ["google"]
-        else:
-            providers_use = providers
+        providers_use = providers or ["google"]
+
+        if "nonce" not in st.session_state:
+            st.session_state["nonce"] = 0
+        if refresh:
+            st.session_state["nonce"] += 1
 
         with st.spinner("제안 수집 중..."):
             try:
-                candidates, hit_counts = collect_suggestions_cached(seeds, providers_use, depth=depth, hl="ko")
+                candidates, hit_counts = collect_suggestions_cached(
+                    seeds, providers_use, depth=depth, hl="ko", nonce=st.session_state["nonce"]
+                )
             except Exception as e:  # noqa: BLE001
                 st.error(f"제안 수집 오류: {e}")
                 return
@@ -146,43 +160,84 @@ def main() -> None:
 
         st.info(f"후보 {len(candidates)}개 점수화 중...")
         metrics_map: Dict[str, EnrichedMetrics] | None = None
-        try:
-            if enrich:
-                enrichers = build_enrichers_from_env()
-                if not enrichers:
-                    st.warning("ENV에 API 키가 없어 휴리스틱으로 진행합니다(.env를 설정하세요).")
-                metrics_map = enrich_keywords(candidates, enrichers, limit=int(enrich_limit))
-                scores = score_keywords_with_metrics(candidates, hit_counts=hit_counts, metrics=metrics_map)
+        if enrich:
+            enrichers = build_enrichers_from_env()
+            if not enrichers:
+                st.warning("ENV에 API 키가 없어 휴리스틱으로 진행합니다(.env를 설정하세요).")
+            metrics_map = enrich_keywords(candidates, enrichers, limit=int(enrich_limit))
+
+        if not platforms:
+            platforms = ["naver", "tistory"]
+        scored: Dict[str, List[KeywordScore]] = {}
+        for pf in platforms:
+            if metrics_map is not None:
+                scored[pf] = score_keywords_by_platform(
+                    candidates, hit_counts=hit_counts, metrics=metrics_map, platform=pf
+                )
             else:
-                scores = score_keywords(candidates, hit_counts=hit_counts)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"점수화 오류: {e}")
-            return
+                scored[pf] = score_keywords(candidates, hit_counts=hit_counts)
 
-        rows = to_rows(scores, metrics_map)
-        st.subheader("결과")
-        st.dataframe(rows[: int(top)], use_container_width=True)
+        tabs = st.tabs([pf.upper() for pf in platforms])
+        for i, pf in enumerate(platforms):
+            with tabs[i]:
+                rows = to_rows(scored[pf], metrics_map)
+                st.dataframe(rows[: int(top)], use_container_width=True)
+                csv_bytes = to_csv_bytes(rows)
+                st.download_button(
+                    f"CSV 다운로드 ({pf})",
+                    data=csv_bytes,
+                    file_name=f"results.{pf}.csv",
+                    mime="text/csv",
+                )
+                if rows:
+                    sel_kw = rows[0]["keyword"]
+                    with st.expander(f"아웃라인 미리보기: {sel_kw}"):
+                        outline = build_outline(sel_kw)
+                        st.write("제목:", outline["title"][0])
+                        st.write("섹션:")
+                        for s in outline["sections"]:
+                            st.write("- ", s)
+                        st.write("FAQ:")
+                        for q in outline["faq"]:
+                            st.write("- ", q)
 
-        csv_bytes = to_csv_bytes(rows)
-        st.download_button(
-            "CSV 다운로드",
-            data=csv_bytes,
-            file_name="results.csv",
-            mime="text/csv",
-        )
+        # Real-time trend section
+        try:
+            naver_only: List[str] = []
+            google_only: List[str] = []
+            if "naver" in providers_use:
+                nav = NaverSuggestProvider()
+                naver_only = nav.bulk_suggest(seeds)
+            if "google" in providers_use:
+                ggl = GoogleSuggestProvider()
+                google_only = ggl.bulk_suggest(seeds, hl="ko")
 
-        # Outline helper for first top result
-        if rows:
-            sel_kw = rows[0]["keyword"]
-            with st.expander(f"아웃라인 미리보기: {sel_kw}"):
-                outline = build_outline(sel_kw)
-                st.write("제목:", outline["title"][0])
-                st.write("섹션:")
-                for s in outline["sections"]:
-                    st.write("- ", s)
-                st.write("FAQ:")
-                for q in outline["faq"]:
-                    st.write("- ", q)
+            if "prev_naver" not in st.session_state:
+                st.session_state["prev_naver"] = []
+            if "prev_google" not in st.session_state:
+                st.session_state["prev_google"] = []
+
+            nav_delta = compute_trends(st.session_state["prev_naver"], naver_only, default_hot_terms())
+            ggl_delta = compute_trends(st.session_state["prev_google"], google_only, default_hot_terms())
+
+            cols = st.columns(2)
+            with cols[0]:
+                st.markdown("### 네이버 급상승")
+                st.write("새로 등장:")
+                st.write(nav_delta.new_suggestions[:20] or "(없음)")
+                st.write("핫 키워드:")
+                st.write([f"{k}×{v}" for k, v in nav_delta.hot_terms[:10]] or "(없음)")
+            with cols[1]:
+                st.markdown("### 티스토리(구글) 급상승")
+                st.write("새로 등장:")
+                st.write(ggl_delta.new_suggestions[:20] or "(없음)")
+                st.write("핫 키워드:")
+                st.write([f"{k}×{v}" for k, v in ggl_delta.hot_terms[:10]] or "(없음)")
+
+            st.session_state["prev_naver"] = naver_only
+            st.session_state["prev_google"] = google_only
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":  # pragma: no cover
